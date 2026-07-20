@@ -12,13 +12,16 @@ import (
 	"strings"
 	"time"
 
+	"cleangate/pkg/util"
+
 	"github.com/pmezard/adblock/adblock"
 )
 
 type Engine struct {
-	matcher  *adblock.RuleMatcher
-	urls     []string
-	cacheDir string
+	matcher   *adblock.RuleMatcher
+	cosmetic  *CosmeticEngine
+	urls      []string
+	cacheDir  string
 	RuleCount int
 }
 
@@ -30,6 +33,7 @@ func NewEngine(urls []string) *Engine {
 
 	return &Engine{
 		matcher:  adblock.NewMatcher(),
+		cosmetic: NewCosmeticEngine(),
 		urls:     urls,
 		cacheDir: cacheDir,
 	}
@@ -49,26 +53,28 @@ func (e *Engine) StartAutoUpdate(interval time.Duration) {
 
 func (e *Engine) updateLists() {
 	newMatcher := adblock.NewMatcher()
+	newCosmetic := NewCosmeticEngine()
 	seenRules := make(map[string]struct{})
 	totalRules := 0
 
 	for _, listUrl := range e.urls {
-		count, err := e.processList(listUrl, newMatcher, seenRules)
+		count, err := e.processList(listUrl, newMatcher, newCosmetic, seenRules)
 		if err != nil {
-			fmt.Printf("Error processing list %s: %v\n", listUrl, err)
+			util.Debugf("Error processing list %s: %v", listUrl, err)
 		} else {
 			totalRules += count
-			fmt.Printf("Successfully loaded %d unique rules from %s\n", count, listUrl)
+			util.Debugf("Successfully loaded %d unique rules from %s", count, listUrl)
 		}
 	}
 
-	// Hot-swap the matcher (pointer swap is atomic)
+	// Hot-swap the matcher and cosmetic engine (pointer swap is atomic)
 	e.matcher = newMatcher
+	e.cosmetic = newCosmetic
 	e.RuleCount = totalRules
-	fmt.Printf("Engine swap complete. Total active unique rules: %d\n", e.RuleCount)
+	util.Debugf("Engine swap complete. Total active unique rules: %d", e.RuleCount)
 }
 
-func (e *Engine) processList(url string, matcher *adblock.RuleMatcher, seen map[string]struct{}) (int, error) {
+func (e *Engine) processList(url string, matcher *adblock.RuleMatcher, cosmetic *CosmeticEngine, seen map[string]struct{}) (int, error) {
 	// Create a safe filename using SHA256 of the URL to avoid path traversal or invalid characters
 	hash := sha256.Sum256([]byte(url))
 	fileName := hex.EncodeToString(hash[:]) + ".txt"
@@ -108,7 +114,7 @@ func (e *Engine) processList(url string, matcher *adblock.RuleMatcher, seen map[
 		
 		if resp.StatusCode == http.StatusOK {
 			// New data downloaded! Save it to our fixed file
-			fmt.Printf("Downloading fresh data for %s...\n", url)
+			util.Debugf("Downloading fresh data for %s...", url)
 			out, err := os.Create(filePath)
 			if err != nil {
 				return 0, fmt.Errorf("failed to create cache file: %v", err)
@@ -125,13 +131,13 @@ func (e *Engine) processList(url string, matcher *adblock.RuleMatcher, seen map[
 			}
 		} else if resp.StatusCode == http.StatusNotModified {
 			// File hasn't changed on server, we use our local cache!
-			fmt.Printf("List %s is up to date (304 Not Modified), using cache.\n", url)
+			util.Debugf("List %s is up to date (304 Not Modified), using cache.", url)
 		} else {
 			// Handle errors like 404, fallback to local file if we have it
-			fmt.Printf("Server returned %d for %s, falling back to cache if available.\n", resp.StatusCode, url)
+			util.Debugf("Server returned %d for %s, falling back to cache if available.", resp.StatusCode, url)
 		}
 	} else if fileExists {
-		fmt.Printf("Network error %v, falling back to cached file for %s.\n", err, url)
+		util.Debugf("Network error %v, falling back to cached file for %s.", err, url)
 	} else {
 		return 0, fmt.Errorf("network error and no cache available: %v", err)
 	}
@@ -165,6 +171,12 @@ func (e *Engine) processList(url string, matcher *adblock.RuleMatcher, seen map[
 		}
 		seen[line] = struct{}{} // Mark as seen
 
+		// Check if it's a cosmetic rule
+		if cosmetic.ParseLine(line) {
+			addedCount++
+			continue
+		}
+
 		rule, err := adblock.ParseRule(line)
 		if err == nil && rule != nil {
 			matcher.AddRule(rule, 0)
@@ -191,4 +203,12 @@ func (e *Engine) IsBlocked(requestUrl string, sourceDomain string) bool {
 		return false
 	}
 	return matched
+}
+
+// GetInjectionCSS returns the CSS payload to hide elements for a specific domain
+func (e *Engine) GetInjectionCSS(domain string) string {
+	if e.cosmetic == nil {
+		return ""
+	}
+	return e.cosmetic.GetInjectionCSS(domain)
 }

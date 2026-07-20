@@ -36,3 +36,12 @@ func PrintJSON(v interface{}) {
 		fmt.Println(string(b))
 	}
 }
+
+var DebugMode bool
+
+// Debugf prints formatted logs only if DebugMode is true
+func Debugf(format string, a ...interface{}) {
+	if DebugMode {
+		fmt.Printf("[DEBUG] "+format+"\n", a...)
+	}
+}

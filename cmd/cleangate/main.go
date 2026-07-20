@@ -25,8 +25,12 @@ func main() {
 	listsStr := flag.String("lists", "easylist,adguard", "Comma-separated list of Filter IDs or URLs")
 	updateInterval := flag.Int("update-interval", 24, "List auto-update interval in hours")
 	whitelistStr := flag.String("whitelist", "", "Comma-separated list of bypassed domains")
+	debug := flag.Bool("debug", false, "Enable verbose debug logging")
 	
 	flag.Parse()
+
+	util.DebugMode = *debug
+	util.Debugf("Starting CleanGate with Debug Mode ENABLED")
 
 	// 1. Initialize Certificate Manager (MITM)
 	// For production, CA should also go to UserConfigDir

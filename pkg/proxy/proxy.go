@@ -12,6 +12,7 @@ import (
 
 	"cleangate/pkg/cert"
 	"cleangate/pkg/engine"
+	"cleangate/pkg/util"
 )
 
 type Server struct {
@@ -36,8 +37,8 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("CleanGate Proxy started on %s\n", addr)
-	fmt.Printf("Using Upstream Proxy: %s\n", s.upstream)
+	util.Debugf("CleanGate Proxy started on %s", addr)
+	util.Debugf("Using Upstream Proxy: %s", s.upstream)
 
 	for {
 		conn, err := l.Accept()
@@ -46,10 +47,12 @@ func (s *Server) Start(ctx context.Context) error {
 			case <-ctx.Done():
 				return nil
 			default:
+				util.Debugf("Accept error: %v", err)
 				continue
 			}
 		}
 
+		util.Debugf("New connection from %s", conn.RemoteAddr())
 		go s.handleConnection(conn)
 	}
 }
@@ -74,14 +77,17 @@ func (s *Server) handleHTTP(conn net.Conn, clientReader *bufio.Reader, req *http
 	defer conn.Close()
 
 	if s.engine.IsBlocked(req.URL.String(), req.Host) {
-		fmt.Printf("[BLOCKED HTTP] %s\n", req.URL.String())
+		util.Debugf("[BLOCKED HTTP] %s", req.URL.String())
 		conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\nBlocked by CleanGate"))
 		return
 	}
 
+	util.Debugf("[ALLOWED HTTP] %s -> Forwarding to %s", req.URL.String(), s.upstream)
+
 	// Connect to upstream proxy
 	upstreamConn, err := net.Dial("tcp", s.upstream)
 	if err != nil {
+		util.Debugf("Upstream Dial error: %v", err)
 		return
 	}
 	defer upstreamConn.Close()
@@ -100,11 +106,13 @@ func (s *Server) handleHTTP(conn net.Conn, clientReader *bufio.Reader, req *http
 func (s *Server) handleHTTPS(conn net.Conn, clientReader *bufio.Reader, req *http.Request) {
 	// Quick domain-level block check before MITM
 	if s.engine.IsBlocked("https://"+req.Host, req.Host) {
-		fmt.Printf("[BLOCKED HTTPS DOMAIN] %s\n", req.Host)
+		util.Debugf("[BLOCKED HTTPS DOMAIN] %s", req.Host)
 		conn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\nBlocked by CleanGate"))
 		conn.Close()
 		return
 	}
+
+	util.Debugf("Establishing MITM for HTTPS domain: %s", req.Host)
 
 	// 1. Tell the client we are ready for TLS
 	_, err := conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
@@ -114,10 +122,14 @@ func (s *Server) handleHTTPS(conn net.Conn, clientReader *bufio.Reader, req *htt
 	}
 
 	// 2. Wrap client connection in TLS Server (MITM)
-	tlsConn := tls.Server(conn, s.certManager.TLSConfig())
+	// Force HTTP/1.1 to simplify interception loop
+	tlsConf := s.certManager.TLSConfig().Clone()
+	tlsConf.NextProtos = []string{"http/1.1"}
+
+	tlsConn := tls.Server(conn, tlsConf)
 	err = tlsConn.Handshake()
 	if err != nil {
-		fmt.Printf("MITM Handshake failed for %s: %v\n", req.Host, err)
+		util.Debugf("MITM Handshake failed for %s: %v", req.Host, err)
 		conn.Close()
 		return
 	}
@@ -139,14 +151,17 @@ func (s *Server) handleHTTPS(conn net.Conn, clientReader *bufio.Reader, req *htt
 
 	// 4. Check Adblock rules against the full URL path
 	if s.engine.IsBlocked(fullURL, req.Host) {
-		fmt.Printf("[BLOCKED HTTPS URL] %s\n", fullURL)
+		util.Debugf("[BLOCKED HTTPS URL] %s", fullURL)
 		tlsConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\nBlocked by CleanGate"))
 		return
 	}
 
+	util.Debugf("[ALLOWED HTTPS] %s -> Forwarding to %s via CONNECT", fullURL, s.upstream)
+
 	// 5. Connect to upstream (OpenGate) via TCP
 	upstreamConn, err := net.Dial("tcp", s.upstream)
 	if err != nil {
+		util.Debugf("HTTPS Upstream Dial error: %v", err)
 		return
 	}
 	defer upstreamConn.Close()
@@ -168,14 +183,74 @@ func (s *Server) handleHTTPS(conn net.Conn, clientReader *bufio.Reader, req *htt
 	})
 	err = targetTLSConn.Handshake()
 	if err != nil {
+		util.Debugf("Target TLS Handshake failed: %v", err)
 		return
 	}
 	defer targetTLSConn.Close()
 
-	// 8. Forward the intercepted HTTP request to the target TLS connection
-	innerReq.Write(targetTLSConn)
+	util.Debugf("Starting HTTP interceptor loop for %s", req.Host)
+	s.proxyLoop(tlsConn, targetTLSConn, tlsReader, req.Host, innerReq)
+}
 
-	// 9. Transparently pipe the rest of the bidirectional TLS data
-	go io.Copy(targetTLSConn, tlsReader)
-	io.Copy(tlsConn, targetTLSConn)
+func (s *Server) proxyLoop(clientConn net.Conn, targetConn net.Conn, clientReader *bufio.Reader, targetHost string, firstReq *http.Request) {
+	targetReader := bufio.NewReader(targetConn)
+	req := firstReq
+
+	for {
+		// 1. Perform Network Block Check (Crucial: do this before writing to target!)
+		fullURL := "https://" + targetHost + req.URL.Path
+		if req.URL.RawQuery != "" {
+			fullURL += "?" + req.URL.RawQuery
+		}
+
+		// Extract Source Domain from Referer (Crucial for third-party adblock rules)
+		sourceDomain := targetHost
+		if ref := req.Header.Get("Referer"); ref != "" {
+			if strings.Contains(ref, "://") {
+				parts := strings.Split(ref, "/")
+				if len(parts) > 2 {
+					sourceDomain = strings.Split(parts[2], ":")[0]
+				}
+			}
+		}
+
+		if s.engine.IsBlocked(fullURL, sourceDomain) {
+			util.Debugf("[BLOCKED HTTPS URL] %s", fullURL)
+			clientConn.Write([]byte("HTTP/1.1 403 Forbidden\r\n\r\nBlocked by CleanGate"))
+			return // Connection closed to prevent broken streams
+		}
+
+		// 2. Forward request to target
+		err := req.Write(targetConn)
+		if err != nil {
+			return
+		}
+
+		// 3. Read response from target
+		resp, err := http.ReadResponse(targetReader, req)
+		if err != nil {
+			return
+		}
+
+		// 4. Get Cosmetic CSS for this domain and Inject it
+		css := s.engine.GetInjectionCSS(targetHost)
+		if css != "" {
+			err = InjectHTML(resp, css)
+			if err != nil {
+				util.Debugf("HTML Injection failed for %s: %v", targetHost, err)
+			}
+		}
+
+		// 5. Forward response to client
+		err = resp.Write(clientConn)
+		if err != nil {
+			return
+		}
+
+		// 6. Read next request on this Keep-Alive connection
+		req, err = http.ReadRequest(clientReader)
+		if err != nil {
+			return // Connection closed or timeout
+		}
+	}
 }
