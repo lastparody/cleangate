@@ -79,14 +79,21 @@ func main() {
 	// TODO: Apply whitelist rules to engine here
 	_ = whitelistStr
 
-	// 3. Start the Proxy Server
+	// 3. Set System Proxy (macOS)
+	if *systemProxy {
+		if proxyErr := util.SetSystemProxy(*addr, *port); proxyErr != nil {
+			util.Debugf("Failed to set system proxy: %v", proxyErr)
+		}
+	}
+
+	// 4. Start the Proxy Server
 	srv := proxy.NewServer(*port, *upstream, adEngine, certManager)
 	
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	go func() {
-		if err := srv.Start(ctx); err != nil {
+		if startErr := srv.Start(ctx); startErr != nil {
 			os.Exit(1)
 		}
 	}()
@@ -100,10 +107,17 @@ func main() {
 		SystemProxySet: *systemProxy,
 	})
 
-	// 4. Handle Shutdown
+	// 5. Handle Shutdown
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	<-sigs
+
+	// Unset System Proxy before exiting
+	if *systemProxy {
+		if proxyErr := util.UnsetSystemProxy(); proxyErr != nil {
+			util.Debugf("Failed to unset system proxy: %v", proxyErr)
+		}
+	}
 
 	cancel()
 

@@ -41,20 +41,26 @@ func InitCA(dataDir string) (*CertManager, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Install to keychain
-		fmt.Println("Installing Root CA to macOS Keychain. You may be prompted for your password.")
-		err = installToKeychain(caPath)
-		if err != nil {
-			fmt.Printf("Failed to install to keychain (you can install manually: %s): %v\n", caPath, err)
-		} else {
-			fmt.Println("Successfully installed Root CA to Keychain!")
-		}
 	} else {
 		fmt.Println("Loading existing Root CA...")
 		caCert, caKey, err = loadCA(caPath, keyPath)
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	// Always check if the cert is trusted in Keychain and install if not
+	if !isCertTrusted(caPath) {
+		fmt.Println("Root CA is NOT trusted. Installing to macOS Keychain...")
+		fmt.Println("You will be prompted for your macOS password.")
+		err := installToKeychain(caPath)
+		if err != nil {
+			fmt.Printf("Failed to install to keychain (you can install manually: %s): %v\n", caPath, err)
+		} else {
+			fmt.Println("Successfully installed Root CA to Keychain!")
+		}
+	} else {
+		fmt.Println("Root CA is already trusted in Keychain.")
 	}
 
 	cm := &CertManager{
@@ -168,20 +174,21 @@ func loadCA(certPath, keyPath string) (*x509.Certificate, *rsa.PrivateKey, error
 	return caCert, caKey, nil
 }
 
-func installToKeychain(certPath string) error {
-	// Uses macOS security command to add and trust the certificate
-	cmd := exec.Command("sudo", "security", "add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", certPath)
-	// Alternatively, avoiding sudo if we add to login keychain and trust it for SSL (still prompts)
-	// cmd := exec.Command("security", "add-trusted-cert", "-p", "ssl", "-k", os.Getenv("HOME")+"/Library/Keychains/login.keychain-db", certPath)
-	
-	// We'll use the sudo method as it ensures system-wide trust for browsers like Chrome which use system store
-	// Note: Running via exec.Command("sudo"...) in a GUI app might fail if it can't prompt for password via terminal.
-	// For a complete macOS integration, an AppleScript prompt is better:
-	appleScript := fmt.Sprintf(`do shell script "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain '%s'" with administrator privileges`, certPath)
-	cmd = exec.Command("osascript", "-e", appleScript)
-	
+// isCertTrusted checks if the CleanGate CA cert is in the macOS System Keychain as trusted
+func isCertTrusted(certPath string) bool {
+	// Use `security verify-cert` to check if the cert is trusted for SSL
+	cmd := exec.Command("security", "verify-cert", "-c", certPath, "-p", "ssl")
 	err := cmd.Run()
-	return err
+	return err == nil
+}
+
+func installToKeychain(certPath string) error {
+	// Use sudo directly — it will prompt for password in the terminal
+	cmd := exec.Command("sudo", "security", "add-trusted-cert", "-d", "-r", "trustRoot", "-k", "/Library/Keychains/System.keychain", certPath)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func generateLeafCert(domain string, caCert *x509.Certificate, caKey *rsa.PrivateKey) (*tls.Certificate, error) {

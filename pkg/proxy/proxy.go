@@ -158,32 +158,57 @@ func (s *Server) handleHTTPS(conn net.Conn, clientReader *bufio.Reader, req *htt
 
 	util.Debugf("[ALLOWED HTTPS] %s -> Forwarding to %s via CONNECT", fullURL, s.upstream)
 
-	// 5. Connect to upstream (OpenGate) via TCP
-	upstreamConn, err := net.Dial("tcp", s.upstream)
-	if err != nil {
-		util.Debugf("HTTPS Upstream Dial error: %v", err)
-		return
+	// 5. Connect to target - either via upstream proxy or directly
+	var targetNetConn net.Conn
+	if s.upstream != "" {
+		// Connect via upstream proxy (OpenGate)
+		upstreamConn, err := net.Dial("tcp", s.upstream)
+		if err != nil {
+			util.Debugf("HTTPS Upstream Dial error (falling back to direct): %v", err)
+			// Fallback to direct connection
+			goto directConnect
+		}
+
+		// 6. Ask upstream proxy to CONNECT to the target
+		connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", req.Host, req.Host)
+		upstreamConn.Write([]byte(connectReq))
+
+		upstreamReader := bufio.NewReader(upstreamConn)
+		upstreamResp, err := http.ReadResponse(upstreamReader, nil)
+		if err != nil || upstreamResp.StatusCode != 200 {
+			upstreamConn.Close()
+			util.Debugf("Upstream CONNECT failed, falling back to direct")
+			goto directConnect
+		}
+		targetNetConn = upstreamConn
+		goto tlsConnect
 	}
-	defer upstreamConn.Close()
 
-	// 6. Ask Upstream proxy to CONNECT to the target server
-	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", req.Host, req.Host)
-	upstreamConn.Write([]byte(connectReq))
-
-	// Read upstream's 200 OK response
-	upstreamReader := bufio.NewReader(upstreamConn)
-	upstreamResp, err := http.ReadResponse(upstreamReader, nil)
-	if err != nil || upstreamResp.StatusCode != 200 {
-		return
+directConnect:
+	{
+		// Direct connection to target server
+		host := req.Host
+		if !strings.Contains(host, ":") {
+			host += ":443"
+		}
+		directConn, err := net.Dial("tcp", host)
+		if err != nil {
+			util.Debugf("Direct Dial error for %s: %v", host, err)
+			return
+		}
+		targetNetConn = directConn
+		util.Debugf("Connected directly to %s (no upstream proxy)", host)
 	}
 
-	// 7. Establish TLS with the remote server through the upstream tunnel
-	targetTLSConn := tls.Client(upstreamConn, &tls.Config{
+tlsConnect:
+	// 7. Establish TLS with the remote server
+	targetTLSConn := tls.Client(targetNetConn, &tls.Config{
 		ServerName: strings.Split(req.Host, ":")[0],
 	})
 	err = targetTLSConn.Handshake()
 	if err != nil {
 		util.Debugf("Target TLS Handshake failed: %v", err)
+		targetNetConn.Close()
 		return
 	}
 	defer targetTLSConn.Close()
